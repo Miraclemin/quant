@@ -14,11 +14,11 @@ from tqdm import tqdm
 from quant_infra import db_utils
 from quant_infra.const import *
 from quant_infra.get_data import get_ins, get_index_data
+from quant_infra.factor_calc import winsorize
 import itertools
 from pathlib import Path
-# 设置matplotlib支持中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
-plt.rcParams['axes.unicode_minus'] = False    # 用来正常显示负号
+from datetime import datetime
+
 def specific_group(fac, stk, group_set):
     """
     对特定分组进行评估，后续使用Joblib并行回测
@@ -42,7 +42,9 @@ def specific_group(fac, stk, group_set):
 
         # 在特定样本回测时，只保留成分股的因子以及股票收益率
         fac = fac[fac['ts_code'].isin(constituent_stocks)].copy()
+
         stk = stk[stk['ts_code'].isin(constituent_stocks)].copy()
+        stk.sort_values(['ts_code','trade_date'], inplace=True)
 
     # 设定为全市场时，就不用筛选股票了，直接使用全部数据进行评估  
 
@@ -60,43 +62,58 @@ def specific_group(fac, stk, group_set):
         stk[period_col] = stk["date"].dt.to_period(p_freq)
         fac[period_col] = fac["date"].dt.to_period(p_freq)
 
+        fac.sort_values(['ts_code','trade_date'], inplace=True)
+        stk.sort_values(['ts_code','trade_date'], inplace=True)
         # 3. 按股票和周期聚合收益、因子
         # 使用 **{ret_col: ...} 来动态传入列名
         stk_p = (stk.dropna(subset=[period_col])
                 .groupby(["ts_code", period_col], as_index=False)
                 .agg(**{
-                    ret_col: ("ret", lambda x: (1 + x).prod() - 1), # 正确的累计收益率写法
-                    "trade_date": ("trade_date", "last")
+                    ret_col: ("ret", "sum"), # 正确的累计收益率写法
+                    "trade_date": ("trade_date", "max")
                 }))
 
         fac_p = (fac.dropna(subset=[period_col])
                 .groupby(["ts_code", period_col], as_index=False)
                 .agg(**{
                     fac_col: ("factor", "last"), # 取最后一个值作为该周期的因子值
-                    "trade_date": ("trade_date", "last")
+                    "trade_date": ("trade_date", "max")
                 }))
 
-        stk_p = stk_p.sort_values(["ts_code", "trade_date"])
-        fac_p = fac_p.sort_values(["ts_code", "trade_date"])
+        stk_p.sort_values(["ts_code", "trade_date"], inplace=True)
+        fac_p.sort_values(["ts_code", "trade_date"], inplace=True)
 
         # 4. 计算下一周期的收益（Look-ahead return）
         next_ret_col = f"next_ret_{p_freq}"
         stk_p[next_ret_col] = stk_p.groupby("ts_code")[ret_col].shift(-1)
 
-    # 合并因子和收益数据（用于IC计算）    
-    # 合并：因子 + 收益（使用trade_date作为键，因为IC以周期为频段计算相关系数）
-    # 记得保留 period_col，以便用于后面的日频映射
+    # 合并因子和收益数据（用于IC计算）
+    # 用 period_col 做合并键——双方通过同一 Period 对齐，避免 trade_date 细微差异导致大量丢失
+    # trade_date 取因子侧的值（已是该周/月最后交易日）
     df = (
         fac_p[["ts_code", "trade_date", period_col, fac_col]]
-           .merge(stk_p[["ts_code", "trade_date", next_ret_col, ret_col]], on=["ts_code", "trade_date"], how="inner")
+           .merge(stk_p[["ts_code", period_col, next_ret_col, ret_col]], on=["ts_code", period_col], how="inner")
            .dropna(subset=[fac_col, next_ret_col])
            .reset_index(drop=True)
     )
 
     # 计算 IC & IR（基于期间收益率去计算，与下文更具日频收益率计算划分开）
+    # 必须进行过滤，确保IC计算的相关系数有效。
+    # 1. 计算每个交易日对应的股票数量
+    counts = df.groupby('trade_date')[fac_col].transform('count')
+
+    # 2. 仅保留数量大于 500 的行
+    df = df[counts > 500]
+
     # 计算每个周期最后一天的Rank IC（Spearman相关系数）
-    ic_series = df.groupby('trade_date').apply(lambda x: x[fac_col].corr(x[next_ret_col], method='spearman'), include_groups=False)
-    ic_df = pd.DataFrame({'trade_date': ic_series.index, 'ic': ic_series.values})
+    # float() 强制每组返回标量，pandas 任何版本 groupby.apply 均只能返回 Series
+    ic_series = df.groupby('trade_date').apply(
+        lambda x: float(x[fac_col].corr(x[next_ret_col], method='spearman')),
+        include_groups=False
+    )
+    ic_df = ic_series.reset_index()
+    ic_df.columns = ['trade_date', 'ic']
+
 
     # 计算IR（信息比率）= IC均值 / IC标准差
     ic_valid = ic_df["ic"].dropna()
@@ -179,8 +196,7 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH'):
     算法逻辑：
     1. 读取因子数据（从DuckDB表）
     2. 计算各种设定组合（样本、频率）下的分组收益、多空收益、IC等指标
-    3. 生成汇总指标排名柱状图，并输出评价结果至CSV
-    4. 结合基准指数，绘制叠加了各组合表现的多空收益净值对比图
+    3. 输出评价结果至CSV
     
     Args:
         factor_table(str): 因子表名（DuckDB中的表名，如'week_factor'）
@@ -189,8 +205,6 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH'):
     """    
     try:
         fac = db_utils.read_sql(f"SELECT * FROM {factor_table}")
-        if 'raw_factor' in fac.columns:
-            fac = fac.rename(columns={'raw_factor': 'factor'})
 
         # trade_date可能是整数，需要转为字符串后再转为日期
         fac["date"] = pd.to_datetime(fac["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
@@ -202,6 +216,7 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH'):
     stk = db_utils.read_sql("SELECT ts_code, trade_date, pct_chg FROM stock_bar")
     stk["date"] = pd.to_datetime(stk["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
     stk["ret"] = stk["pct_chg"] / 100.0
+    stk["ret"] = winsorize(stk["ret"], n=3)
 
     ## 根据因子的生成频率，过滤掉不合理的调仓频率
     # 比如因子如果是周频(W)或月频(M)，就没办法进行日度调仓，因此回测调仓频率必须大于等于因子频率。
@@ -216,10 +231,10 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH'):
     # 直接进行笛卡尔积，且只使用过滤后的合理频率
     combinations = list(itertools.product(INDEX_NAME_TO_CODE, valid_freqs))
 
-    results = Parallel(n_jobs=7)(
-        delayed(specific_group)(fac, stk, combination) for combination in tqdm(combinations, desc="因子评估进度")
-        )
-    
+    print("开始评估因子在不同样本和频率下的表现...")
+    results = Parallel(n_jobs=-1)(
+        delayed(specific_group)(fac, stk, combination) for combination in combinations
+    )
     results = pd.DataFrame(results)
     
     #确保回测的根目录存在
@@ -243,21 +258,26 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH'):
     # 导出csv
     summary.to_csv(f"{output_path}/summary.csv", index=False, encoding='utf-8-sig')
 
-    print(f'因子评估完成，结果和图片已保存到 {output_path}/')
+    print(f'因子评估完成，结果已保存到 {output_path}/')
     
 def group_plot(sample, freq, line, factor_table):
     """绘制特定样本和频率的多空收益净值曲线"""
+    # 设置matplotlib支持中文字体
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+    plt.rcParams['axes.unicode_minus'] = False    # 用来正常显示负号
     try:
         df = db_utils.read_sql(f"""
             SELECT trade_date, {line} FROM {factor_table}_daily_ls
             WHERE 样本 = '{sample}' AND 频率 = '{freq}'
             ORDER BY trade_date
         """)
-        df['trade_date'] = pd.to_datetime(df['trade_date'])
-        df['cumulative_ls'] = df[line].cumsum()
+        df['trade_date'] = pd.to_datetime(df['trade_date'].astype(str), format='%Y%m%d', errors='coerce')
+        df[line] = winsorize(df[line], n=3)
+        df['cumulative_ret'] = df[line].cumsum()
+
 
         plt.figure(figsize=(12, 6))
-        plt.plot(df['trade_date'], df['cumulative_ls'], label=f'{sample} - {freq}', color='blue')
+        plt.plot(df['trade_date'], df['cumulative_ret'], label=f'{sample} - {freq}', color='blue')
         plt.title(f'{sample} - {freq} {line}收益净值曲线')
         plt.xlabel('日期')
         plt.ylabel(f'累计{line}收益率')

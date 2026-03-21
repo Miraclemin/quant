@@ -11,10 +11,13 @@ import os
 from . import db_utils
 
 # Tushare配置，请确保在环境变量中设置了TB_TOKEN（相关流程请自行ai，或在此处直接输入token）。
-TUSHARE_TOKEN = os.getenv('TB_TOKEN')
-ts.set_token(TUSHARE_TOKEN)
-pro = ts.pro_api()
+token = os.getenv('TB_TOKEN')
 BASIC_INFO_PATH = 'Data/Metadata'
+def _get_pro_client():
+    if not token:
+        raise RuntimeError('未找到TB_TOKEN环境变量，请先配置后再运行。')
+    # 显式传入 token，避免 tushare 在导入阶段进行 token 连接
+    return ts.pro_api(token)
 
 # ====================  数据获取函数  ====================
 def get_ins(index_code):
@@ -30,6 +33,7 @@ def get_ins(index_code):
     end = last_day_of_last_month.strftime('%Y%m%d')
     
     try:
+        pro = _get_pro_client()
         ins = pro.index_weight(index_code=index_code, start_date=start, end_date=end)
         if ins is None or ins.empty:
             print(f"警告: 未获取到指数 {index_code} 的成分股数据")
@@ -44,32 +48,42 @@ def get_ins(index_code):
 
 def get_trade(start_date, end_date):
     """获取交易日历"""
+    pro = _get_pro_client()
     df = pro.trade_cal(exchange='SSE', is_open='1', start_date=start_date, end_date=end_date, fields='cal_date')
     df.to_csv(f'{BASIC_INFO_PATH}/trade_day.csv', index=False)
     return df
 
-def fetch_bar_by_single_date(date, token):
-    """获取单个交易日的股票日线数据，传入token（防止多线程时tushare接口调用失败）"""
-    try:
-        ts.set_token(token)
-        pro = ts.pro_api()
-        df = pro.daily(trade_date=date)
-        time.sleep(0.15)  # 避免频率限制
-        return (date, df)
-    except Exception as e:
-        return (date, None)
-
-def fetch_basic_by_single_date(date, token):
-    """获取单个交易日的股票每日指标,传入token（防止多线程时tushare接口调用失败）"""
-    try:
-        ts.set_token(token)
-        pro = ts.pro_api()
-        df = pro.daily_basic(trade_date=date)
-        time.sleep(0.15)  # 避免频率限制
-        return (date, df)
-    except Exception as e:
-        return (date, None)
-
+def fetch_bar_by_single_date(date):  ## 增加重试机制，避免偶尔的网络问题导致数据缺失
+    for i in range(3):  # 最多重试3次
+        try:
+            pro = _get_pro_client()
+            df = pro.daily(trade_date=date)
+            df = df[df['pct_chg'].abs() < 35]  # 过滤掉涨跌幅超过35%的异常数据
+            if df is not None:
+                time.sleep(0.8) # 基础积分建议增加睡眠时间
+                return (date, df)
+        except Exception as e:
+            if "最多访问" in str(e): # 如果是频率限制，多睡一会儿
+                time.sleep(10)
+            else:
+                print(f"日期 {date} 第 {i+1} 次尝试失败: {e}")
+                time.sleep(2)
+    return (date, None)
+def fetch_basic_by_single_date(date):  ## 增加重试机制，避免偶尔的网络问题导致数据缺失
+    for i in range(3):  # 最多重试3次
+        try:
+            pro = _get_pro_client()
+            df = pro.daily_basic(trade_date=date)
+            if df is not None:
+                time.sleep(1.5) # 基础积分建议增加睡眠时间
+                return (date, df)
+        except Exception as e:
+            if "最多访问" in str(e): # 如果是频率限制，多睡一会儿
+                time.sleep(10)
+            else:
+                print(f"日期 {date} 第 {i+1} 次尝试失败: {e}")
+                time.sleep(2)
+    return (date, None)
 def get_data_by_date(single_function, table_name):
     """
     按交易日多线程循环获取股票日频数据，自动保存数据，返回为空
@@ -87,8 +101,8 @@ def get_data_by_date(single_function, table_name):
 
     print(f"正在下载从{(dates_to_download)[0]}到{(dates_to_download)[-1]}的数据")
     
-    results = Parallel(n_jobs=7)(
-        delayed(single_function)(date, TUSHARE_TOKEN) for date in tqdm(dates_to_download, desc="下载进度"))
+    results = Parallel(n_jobs=-1)(
+        delayed(single_function)(date) for date in tqdm(dates_to_download, desc="下载进度"))
     
     # 过滤掉None结果
     all_df_list = [df for date, df in results if df is not None and not df.empty]
@@ -114,6 +128,7 @@ def get_index_data(index_code):
         print("数据已是最新")
         return 
         
+    pro = _get_pro_client()
     df = pro.index_daily(ts_code=index_code, start_date=dates_to_download[0], end_date=dates_to_download[-1])
     if df is not None and not df.empty:
         db_utils.write_to_db(df, 'index_data', save_mode='append')

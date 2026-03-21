@@ -1,5 +1,8 @@
 # 数据库文件
-Data/data.db
+*.db
+
+# 个人文件
+guide/
 
 # Python 缓存
 __pycache__/

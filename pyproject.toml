@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant_infra"
+version = "0.1.0"
+description = "量化因子研究核心库"
+readme = "README.md"
+requires-python = ">=3.12"
+# 在这里列出你的项目必须安装的库
+dependencies = [
+    "pandas",
+    "numpy",
+    "joblib",
+    "matplotlib",
+    "duckdb",
+    "tqdm",
+    "tushare",
+]
+
+[tool.setuptools.packages.find]
+# 这告诉 setuptools 去 src 目录下寻找代码
+where = ["src"]

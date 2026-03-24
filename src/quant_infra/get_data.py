@@ -8,11 +8,14 @@ from tqdm import tqdm
 
 from joblib import Parallel, delayed
 import os
-from . import db_utils
+from quant_infra import db_utils
+import akshare as ak
+
 
 # Tushare配置，请确保在环境变量中设置了TB_TOKEN（相关流程请自行ai，或在此处直接输入token）。
 token = os.getenv('TB_TOKEN')
 BASIC_INFO_PATH = 'Data/Metadata'
+FETCH_LOG_PATH = f'{BASIC_INFO_PATH}/fetch_log.csv'
 def _get_pro_client():
     if not token:
         raise RuntimeError('未找到TB_TOKEN环境变量，请先配置后再运行。')
@@ -183,7 +186,11 @@ def get_dates_todo(table_name,ts_code=None):
             query = f"SELECT MAX(trade_date) as max_date FROM {table_name}"
         result = db_utils.read_sql(query)
         table_max_date = str(result.iloc[0, 0])
+    except RuntimeError:
+        # db_utils 已将锁定/占用等严重错误包装为 RuntimeError，直接向上抛出
+        raise
     except Exception:
+        # 表不存在是首次运行的正常情况，视为无历史数据
         table_max_date = '0'
     
     # 若表数据落后于最新交易日，则需要下载最新交易数据
@@ -192,3 +199,83 @@ def get_dates_todo(table_name,ts_code=None):
         dates_to_download = dates_to_download_df['cal_date'].astype(str).tolist()
         return sorted(dates_to_download)
              
+
+
+def get_basic():
+    """获取股票基本信息"""
+    pro = _get_pro_client()
+    df = pro.stock_basic()
+    db_utils.write_to_db(df, 'stock_basic', save_mode='replace')
+    return df
+
+def fetch_finan_by_single_stock(ts_code):
+    for i in range(3):
+        try:
+            pro = _get_pro_client()
+            df = pro.fina_indicator(ts_code=ts_code)
+            if df is not None:
+                time.sleep(0.2)  # 财务接口频率限制较严，适当放慢
+                return df
+        except Exception as e:
+            if '最多访问' in str(e):
+                time.sleep(15)
+                # 四次尝试,每个核心睡满一分钟
+            else:
+                print(f"{ts_code} 第 {i+1} 次尝试失败: {e}")
+                time.sleep(1)
+    return None
+
+
+def _get_last_fetch_date(table_name):
+    """从 fetch_log.csv 读取指定表的上次抓取日期，不存在返回 None"""
+    if not os.path.exists(FETCH_LOG_PATH):
+        return None
+    df = pd.read_csv(FETCH_LOG_PATH, dtype=str)
+    row = df[df['table_name'] == table_name]
+    if row.empty:
+        return None
+    return row.iloc[0]['last_fetch_date']
+
+
+def _set_last_fetch_date(table_name):
+    """将指定表的抓取日期更新为今天，写入 fetch_log.csv"""
+    today = datetime.now().strftime('%Y%m%d')
+    if os.path.exists(FETCH_LOG_PATH):
+        df = pd.read_csv(FETCH_LOG_PATH, dtype=str)
+        df = df[df['table_name'] != table_name]
+    else:
+        df = pd.DataFrame(columns=['table_name', 'last_fetch_date'])
+    new_row = pd.DataFrame({'table_name': [table_name], 'last_fetch_date': [today]})
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(FETCH_LOG_PATH, index=False)
+
+
+def get_financial():
+    """获取全量财务数据，每6个月更新一次。从 stock_basic 读取股票列表，并行按股票抓取后统一写库。
+    因为tushare的限制,导致下载的时间很久,大约30分钟
+    """
+    last_fetch = _get_last_fetch_date('fina_indicator')
+    if last_fetch:
+        last_fetch_dt = datetime.strptime(last_fetch, '%Y%m%d')
+        if datetime.now() - last_fetch_dt < timedelta(days=180):
+            print(f"财务数据无需更新，上次更新于 {last_fetch}")
+            return
+
+    stocks_df = db_utils.read_sql("SELECT ts_code FROM stock_basic")
+    ts_codes = stocks_df['ts_code'].tolist()
+    print(f"开始下载 {len(ts_codes)} 只股票的财务数据...")
+
+    results = Parallel(n_jobs=-1)(
+        delayed(fetch_finan_by_single_stock)(code) for code in tqdm(ts_codes, desc="下载进度"))
+
+    all_df = [df for df in results if df is not None and not df.empty]
+    if all_df:
+        new_data = pd.concat(all_df, ignore_index=True)
+        db_utils.write_to_db(new_data, 'fina_indicator', save_mode='replace')
+        _set_last_fetch_date('fina_indicator')
+# if __name__ == "__main__":
+    # pro = _get_pro_client()
+    # df = pro.fina_indicator(ts_code='000001.SZ')
+    # print(df)
+    # get_financial()
+

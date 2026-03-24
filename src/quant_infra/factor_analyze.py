@@ -7,47 +7,27 @@
 
 import pandas as pd
 import numpy as np
-from scipy.stats import spearmanr
 import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
-from tqdm import tqdm
 from quant_infra import db_utils
 from quant_infra.const import *
 from quant_infra.get_data import get_ins, get_index_data
 from quant_infra.factor_calc import winsorize
 import itertools
 from pathlib import Path
-from datetime import datetime
 
-def specific_group(fac, stk, group_set,bench_index):
+def specific_group(fac, stk, group_set, bench_df, n_groups=10):
     """
     对特定分组进行评估，后续使用Joblib并行回测
     Args:
-        fac: 因子数据 ['date','factor','ts_code','trade_date']
-        stk: 股票数据 ['date','ret','ts_code','trade_date']
+        fac: 已按样本过滤并排序的因子数据 ['date','factor','ts_code','trade_date']
+        stk: 已按样本过滤并排序的股票数据 ['date','ret','ts_code','trade_date']
         group_set: 分组集合设定，形如('全市场','日度')
-        bench_index: 基准指数代码
+        bench_df: 基准指数日收益 DataFrame，列为 ['trade_date', 'bench_ret']
     Returns:
         分组收益、多空收益、IC、IR、Sharpe
     """
-    # 如果不是全市场，就筛选成分股
-    if group_set[0] != '全市场':
-        constituent_stocks = None
-        constituent_path = Path(f'./Data/Metadata/{INDEX_NAME_TO_CODE.get(group_set[0])}_ins.csv')
-        if constituent_path.exists():
-            constituents = pd.read_csv(constituent_path)
-            constituent_stocks = set(constituents['con_code'].unique())
-        else:
-            ## 本地不存在，就下载。返回集合
-            constituent_stocks = get_ins(INDEX_NAME_TO_CODE.get(group_set[0]))
-
-        # 在特定样本回测时，只保留成分股的因子以及股票收益率
-        fac = fac[fac['ts_code'].isin(constituent_stocks)].copy()
-
-        stk = stk[stk['ts_code'].isin(constituent_stocks)].copy()
-        stk.sort_values(['ts_code','trade_date'], inplace=True)
-
-    # 设定为全市场时，就不用筛选股票了，直接使用全部数据进行评估  
+    # fac/stk 已在 evaluate_factor 中按样本过滤并预排序，此处无需重复操作
 
     # 非日频的收益率要提前计算。这是为了计算后面的IC，必须对其因子和股票的频率。如果是为了画收益率图，不用这部分
     if group_set[1] != '日度':
@@ -63,14 +43,12 @@ def specific_group(fac, stk, group_set,bench_index):
         stk[period_col] = stk["date"].dt.to_period(p_freq)
         fac[period_col] = fac["date"].dt.to_period(p_freq)
 
-        fac.sort_values(['ts_code','trade_date'], inplace=True)
-        stk.sort_values(['ts_code','trade_date'], inplace=True)
         # 3. 按股票和周期聚合收益、因子
         # 使用 **{ret_col: ...} 来动态传入列名
         stk_p = (stk.dropna(subset=[period_col])
                 .groupby(["ts_code", period_col], as_index=False)
                 .agg(**{
-                    ret_col: ("ret", "sum"), # 正确的累计收益率写法
+                    ret_col: ("ret", lambda x: (1 + x).prod() - 1), # 复利累计收益率
                     "trade_date": ("trade_date", "max")
                 }))
 
@@ -120,7 +98,7 @@ def specific_group(fac, stk, group_set,bench_index):
     counts = df.groupby('trade_date')[fac_col].transform('count')
 
     # 2. 仅保留数量大于 500 的行
-    df = df[counts > 500]
+    # df = df[counts > 500]
 
     # 计算每个周期最后一天的Rank IC（Spearman相关系数）
     # float() 强制每组返回标量，pandas 任何版本 groupby.apply 均只能返回 Series
@@ -141,15 +119,12 @@ def specific_group(fac, stk, group_set,bench_index):
             IC / ic_valid.std() ## 默认为样本标准差
             ) if ic_valid.std() > 0 else np.nan
 
-    ## 设定分多少组，默认10组
-    n_groups = 10
-    def cut(factor_series, num_groups):
-            return pd.qcut(factor_series, num_groups, labels=False, duplicates="drop") + 1 ## 遇到重复的边界值，会自动减少分组数
-
-    
-    ## 按照当期因子值来分组
+    ## 按照当期因子值来分组（向量化分位分组，替代逐组 qcut）
     df = df.sort_values(["trade_date", "ts_code"])
-    df["group"] = df.groupby("trade_date")[fac_col].apply(cut, num_groups=n_groups).reset_index(level=0, drop=True)
+    factor_rank = df.groupby("trade_date")[fac_col].rank(method='first', na_option='keep') # 每日因子值排名，method='first'确保相同因子值的股票按出现顺序排名，na_option='keep'保持NaN为NaN rank越大因子值越高
+    daily_count = df.groupby("trade_date")[fac_col].transform('count')  # 每日股票数量
+    group_raw   = np.ceil(factor_rank / daily_count * n_groups).clip(1, n_groups)
+    df["group"] = group_raw.where(group_raw.notna(), other=np.nan).astype('Int64')
 
     ## --- 计算日度组合收益率，用于绘制净值曲线与计算指标LS、年化夏普 ---
     # T期末计算的因子分组，在T+1期（hold_period）持有
@@ -184,16 +159,13 @@ def specific_group(fac, stk, group_set,bench_index):
     ls_valid = daily_ls["ls_ret"].dropna()
     SR = float(ls_valid.mean() / ls_valid.std() * np.sqrt(242)) if ls_valid.std() > 0 else np.nan
 
-    # 计算各分组在整个回测区间内，每日收益率的累计总收益
-    # 这样无论是哪种调仓频率，最终统计出的分组收益都是基于相同日度底层计算出的
+    # 计算各分组年化收益率（跨时间用几何平均年化，同一时间截面已用算术平均合并为 daily_ret）
+    # 以 % 形式显示，如 15.23 表示 15.23%
     group_stats = daily_group_ret.groupby('group', as_index=False).agg(
-        group_ret=('daily_ret', 'sum')
+        group_ret=('daily_ret', lambda x: ((1 + x).prod() ** (242 / len(x)) - 1) * 100)
     )
 
-    bench = get_index_data(bench_index)
-    bench['bench_ret'] = bench['pct_chg'] / 100.0
-    # 提取所有自带日频收益率的股票明细
-    daily_ls = daily_ls.merge(bench[["trade_date", "bench_ret"]], on=['trade_date'], how='inner')
+    daily_ls = daily_ls.merge(bench_df, on=['trade_date'], how='inner')
 
     # 组装为一个扁平的字典，便于最后在 joblib 中直接 pd.DataFrame(results) 组合成一张大表
     result_dict = {
@@ -202,16 +174,17 @@ def specific_group(fac, stk, group_set,bench_index):
         'IC': round(IC, 2),
         'IR': round(IR, 2),
         'SR': round(SR, 2),
-        'daily_ls': daily_ls[['trade_date', 'ls_ret', 'long', 'short', 'bench_ret']] # 同时存储多空收益和纯多头、纯空头收益
+        'daily_ls': daily_ls[['trade_date', 'ls_ret', 'long', 'short', 'bench_ret']], # 同时存储多空收益和纯多头、纯空头收益
+        'ic_series': ic_df[['trade_date', 'ic']]
     }
 
     # 将各分组平均收益也加入上述字典
     for g, val in zip(group_stats["group"], group_stats["group_ret"]):
-        result_dict[f"Group_{g}_ret"] = round(float(val), 2)
+        result_dict[f"Group_{g}_ret"] = f"{round(float(val), 2)}%"
         
     return result_dict
 
-def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH',other_name=None):
+def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH', other_name=None, samples=None, n_groups=10):
     """
     因子评估主流程
     
@@ -225,6 +198,8 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH',other_name=N
         fac_freq(str): 因子的频率
         bench_index(str): 基准指数代码（默认'000002.SH'，全A指数）
         other_name(str): 因子列的原始名称（默认None，如果提供则重命名为'factor'）
+        samples(list|str|None): 限定回测的样本，如 '全市场' 或 ['全市场','中证1000']，默认None表示全部
+        n_groups(int): 分组组数（默认10组）
     """    
     try:
         fac = db_utils.read_sql(f"SELECT * FROM {factor_table}")
@@ -252,13 +227,41 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH',other_name=N
         if freq_priority.get(name, 99) >= freq_priority.get(fac_freq, 0)
     }
 
+    # 根据 samples 参数限定回测样本范围
+    if samples is not None:
+        sample_filter = [samples] if isinstance(samples, str) else list(samples)
+        active_samples = {k: v for k, v in INDEX_NAME_TO_CODE.items() if k in sample_filter}
+    else:
+        active_samples = INDEX_NAME_TO_CODE
+
     ## 每种设定都回归一下
     # 直接进行笛卡尔积，且只使用过滤后的合理频率
-    combinations = list(itertools.product(INDEX_NAME_TO_CODE, valid_freqs))
+    combinations = list(itertools.product(active_samples, valid_freqs))
+
+    # 预计算各样本成分股集合并预过滤数据，避免在并行 worker 内重复 I/O 和大对象序列化
+    # 日收益字典，key为样本名称，value为对应的股票日收益数据（已过滤成分股）
+    stk_sorted = stk.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
+    sample_fac: dict = {}
+    sample_stk: dict = {}
+
+    for sample_name, index_code in active_samples.items():
+        if sample_name == '全市场':
+            sample_fac[sample_name] = fac.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
+            sample_stk[sample_name] = stk_sorted
+        else:
+            ins_path = Path(f'./Data/Metadata/{index_code}_ins.csv')
+            constituent_stocks = set(pd.read_csv(ins_path)['con_code'].unique()) if ins_path.exists() else get_ins(index_code)
+            sample_fac[sample_name] = fac[fac['ts_code'].isin(constituent_stocks)].sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
+            sample_stk[sample_name] = stk_sorted[stk_sorted['ts_code'].isin(constituent_stocks)].reset_index(drop=True)
+
+    bench_raw = get_index_data(bench_index)
+    bench_raw['bench_ret'] = bench_raw['pct_chg'] / 100.0
+    bench_df = bench_raw[['trade_date', 'bench_ret']].copy()
 
     print("开始评估因子在不同样本和频率下的表现...")
     results = Parallel(n_jobs=-1)(
-        delayed(specific_group)(fac, stk, combination,bench_index) for combination in combinations
+        delayed(specific_group)(sample_fac[combo[0]], sample_stk[combo[0]], combo, bench_df, n_groups)
+        for combo in combinations
     )
     results = pd.DataFrame(results)
     
@@ -275,10 +278,21 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH',other_name=N
         daily_ls_list.append(df_daily)
     
     daily_ls_combined = pd.concat(daily_ls_list, ignore_index=True)
-    db_utils.write_to_db(daily_ls_combined, f'{factor_table}_daily_ls', save_mode ='replace')
-    
-    # 提取除daily_ls之外的指标，并导出为csv
-    summary = results.drop(columns=['daily_ls'])
+    db_utils.write_to_db(daily_ls_combined, f'{factor_table}_daily_ls', save_mode='replace')
+
+    # 提取 ic_series 数据并写入数据库
+    ic_series_list = []
+    for idx, row in results.iterrows():
+        df_ic = row['ic_series'].copy()
+        df_ic['样本'] = row['样本']
+        df_ic['频率'] = row['频率']
+        ic_series_list.append(df_ic)
+
+    ic_series_combined = pd.concat(ic_series_list, ignore_index=True)
+    db_utils.write_to_db(ic_series_combined, f'{factor_table}_ic_series', save_mode='replace')
+
+    # 提取除daily_ls、ic_series之外的指标，并导出为csv
+    summary = results.drop(columns=['daily_ls', 'ic_series'])
 
     # 导出csv
     summary.to_csv(f"{output_path}/summary.csv", index=False, encoding='utf-8-sig')
@@ -286,9 +300,9 @@ def evaluate_factor(factor_table, fac_freq, bench_index='000002.SH',other_name=N
     print(f'因子评估完成，结果已保存到 {output_path}/')
     
 def group_plot(sample, freq, line, factor_table):
-    """绘制特定样本和频率的多空收益净值曲线"""
+    """绘制特定样本和频率的多空收益净值曲线及IC序列"""
     # 设置matplotlib支持中文字体
-    plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 用来正常显示中文标签
     plt.rcParams['axes.unicode_minus'] = False    # 用来正常显示负号
     try:
         df = db_utils.read_sql(f"""
@@ -298,26 +312,87 @@ def group_plot(sample, freq, line, factor_table):
         """)
         df['trade_date'] = pd.to_datetime(df['trade_date'].astype(str), format='%Y%m%d', errors='coerce')
         df[line] = winsorize(df[line], n=3)
-        df['cumulative_ret'] = df[line].cumsum()
-        df['cumulative_bench'] = df['bench_ret'].cumsum()
+        # 累积净值，起始为 1
+        df['net_value'] = (1 + df[line]).cumprod()
+        df['net_value_bench'] = (1 + df['bench_ret']).cumprod()
 
+        ic_df = db_utils.read_sql(f"""
+            SELECT trade_date, ic FROM {factor_table}_ic_series
+            WHERE 样本 = '{sample}' AND 频率 = '{freq}'
+            ORDER BY trade_date
+        """)
+        ic_df['trade_date'] = pd.to_datetime(ic_df['trade_date'].astype(str), format='%Y%m%d', errors='coerce')
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(df['trade_date'], df['cumulative_ret'], label=f'{sample} - {freq}', color='blue')
-        plt.plot(df['trade_date'], df['cumulative_bench'], label=f'基准收益', color='red')
+        # --- 计算绩效指标 ---
+        line_ret = df[line].dropna()
+        n = len(line_ret)
+        net_value = df['net_value'].reindex(line_ret.index)
 
-        plt.title(f'{sample} - {freq} {line}收益净值曲线')
-        plt.xlabel('日期')
-        plt.ylabel(f'累计收益率')
-        plt.legend()
-        plt.grid()
+        ann_ret         = net_value.iloc[-1] ** (242 / n) - 1
+        bench_r         = df['bench_ret'].reindex(line_ret.index)
+        net_value_bench = df['net_value_bench'].reindex(line_ret.index)
+        ann_bench       = net_value_bench.iloc[-1] ** (242 / len(bench_r)) - 1
+        excess_ann      = ann_ret - ann_bench
+        vol             = line_ret.std() * np.sqrt(242)
+        max_dd          = - ((net_value - net_value.cummax()) / net_value.cummax()).min()
+
+        excess_ann_str = f"{round(excess_ann * 100, 2)}%"
+        vol_str        = f"{round(vol * 100, 2)}%"
+        max_dd_str     = f"{round(max_dd * 100, 2)}%"
+
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 11),
+                                             gridspec_kw={'height_ratios': [1.5, 1, 0.25]})
+
+        # 上图：净值曲线，起始为 1；副坐标轴显示策略/基准相对净值
+        ax1.plot(df['trade_date'], df['net_value'], label=f'{sample} - {freq}', color='blue')
+        ax1.plot(df['trade_date'], df['net_value_bench'], label='基准净值', color='red')
+        ax1.set_title(f'{sample} - {freq} {line}净值曲线')
+        ax1.set_xlabel('日期')
+        ax1.set_ylabel('净值')
+        ax1.legend(loc='upper left')
+        ax1.grid()
+
+        ax1_r = ax1.twinx()
+        relative_nav = df['net_value'] / df['net_value_bench']
+        ax1_r.plot(df['trade_date'], relative_nav, label='策略/基准', color='green', linewidth=1)
+        ax1_r.set_ylabel('相对净值')
+        ax1_r.legend(loc='upper right')
+
+        # 下图：IC序列柱状图（正值红色，负值绿色）
+        ic_mean = ic_df['ic'].mean()
+        colors = ['red' if v >= 0 else 'green' for v in ic_df['ic']]
+        ax2.bar(ic_df['trade_date'], ic_df['ic'], color=colors, width=15, label='IC')
+        ax2.axhline(ic_mean, color='black', linestyle='--', linewidth=1, label=f'均值 {ic_mean:.3f}')
+        ax2.axhline(0, color='gray', linestyle='-', linewidth=0.8)
+        ax2.set_title(f'{sample} - {freq} IC序列')
+        ax2.set_xlabel('日期')
+        ax2.set_ylabel('IC')
+        ax2.legend()
+        ax2.grid(axis='y')
+
+        # 底部：绩效指标表格
+        ax3.axis('off')
+        tbl = ax3.table(
+            cellText=[[excess_ann_str, vol_str, max_dd_str]],
+            colLabels=['超额年化收益', '波动率', '最大回撤'],
+            loc='center',
+            cellLoc='center',
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(11)
+        tbl.scale(1, 1.8)
+
         plt.tight_layout()
-        
+
         output_path = Path("factor_mining") / factor_table / "output"
         output_path.mkdir(parents=True, exist_ok=True)
-        
+
         plt.savefig(output_path / f'{sample}_{freq}_{line}_curve.png')
         plt.close()
+
     except Exception as e:
         print(f'错误：无法绘制{sample} - {freq}的{line}收益曲线: {e}')
+
+
+
 

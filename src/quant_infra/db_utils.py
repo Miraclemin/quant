@@ -16,7 +16,15 @@ def init_db():
     1、解析路径，2、定位到父目录，3、创建父目录（如果不存在），4、如果存在也不报错
     """
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    return duckdb.connect(DB_PATH)
+    try:
+        return duckdb.connect(DB_PATH)
+    except duckdb.IOException as e:
+        msg = str(e)
+        if any(kw in msg for kw in ('Could not set lock', 'already open', '另一个程序', 'resource temporarily unavailable')):
+            raise RuntimeError(
+                f"数据库文件 '{DB_PATH}' 正被其他程序占用，请先关闭后重试。\n({msg.splitlines()[0]})"
+            ) from None
+        raise
 
 def read_sql(query):
     """
@@ -60,9 +68,10 @@ def write_to_db(df, table_name, save_mode ='replace'):
         else:
             # 如果表格不存在，直接创建
             conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM temp_df")
-        print(f"新增数据：{len(df)} 行")
+        print(f"{table_name}新增数据：{len(df)} 行")
     finally:
         conn.close()
+
 
 
 

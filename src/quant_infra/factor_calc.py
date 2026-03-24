@@ -5,7 +5,8 @@ import os
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from quant_infra import db_utils, get_data
-from datetime import datetime
+from datetime import datetime, timedelta
+from pandas.tseries.offsets import MonthBegin
 
 #按日期计算定价因子   
 # 定义单日计算函数
@@ -57,9 +58,11 @@ def compute_pricing_factors():
     if not dates_to_download:
         print("定价因子数据已是最新")
         return 
-    # 过滤出需要计算的日期，由于是几个定价因子都是当月值，所以要有“当月第一个天————最新日期的完整数据”
+    
+    print('开始计算新的定价因子')
+    # 过滤出需要计算的日期，由于是几个定价因子都是依据上一个月末的数据算的，所以要有“上个月第一个天————最新日期的完整数据”
     # 除了第一次计算要算beta外，后续计算时，只用算出几个定价因子值就可以了
-    first_month_date = pd.to_datetime(str(dates_to_download[0]), format='%Y%m%d').to_period('M').to_timestamp() 
+    first_month_date = pd.to_datetime(str(dates_to_download[0]), format='%Y%m%d') - MonthBegin(2)
     first_month_date_str = first_month_date.strftime('%Y%m%d')
     last_date = dates_to_download[-1]
 
@@ -74,10 +77,10 @@ def compute_pricing_factors():
     df = db_utils.read_sql(query)
 
     if len(df) == 0:
-        print('合并后没有数据')
+        print('daily_basic和 stock_bar 合并后没有数据，检查两表的最新数据是否下载成功')
         return
     
-    print('开始计算新数据')
+
     # 3. 添加年月标识（用于分组，基于trade_date）
     # print('计算年月标识...')
     df['date'] = pd.to_datetime(df['trade_date'].astype(str), format='%Y%m%d', errors='coerce')
@@ -107,7 +110,8 @@ def compute_pricing_factors():
     # 删掉月度表里原本的当月值列（由日数据聚合得到的），避免重名冲突
     monthly_df = monthly_df.drop(columns=['pct_chg', 'total_mv', 'pb'])
     df = pd.merge(df[['ts_code', 'trade_date', 'pct_chg', 'year_month']], monthly_df, on=['ts_code', 'year_month'], how='left')
-    
+    df.dropna(subset=['month_ret', 'month_mv', 'month_pb'], inplace=True)
+    df = df[df['trade_date'].isin(dates_to_download)]
     # 5.按交易日分组，并行计算每个交易日的定价因子
     daily_groups = list(df.groupby('trade_date'))
     
@@ -124,7 +128,6 @@ def compute_pricing_factors():
     result_df = result_df.dropna(subset=['MKT', 'SMB', 'HML', 'UMD'])  # 过滤掉因子值为NaN的行
     # 将结果写入数据库
     db_utils.write_to_db(result_df, 'pricing_factors', save_mode='append')
-    print("定价因子计算完成")
     return 
 
 def calc_single_beta(ts_code, stock_df):
@@ -205,8 +208,6 @@ def calc_resid():
     # **过滤掉定价因子为NaN的行**
     df = df.dropna(subset=['pct_chg', 'MKT', 'SMB', 'HML', 'UMD'])
     
-    
-    
     ## 如果本地没有beta，就先计算出beta并保存到数据库，后续计算因子时就可以直接读取beta了
     if not existing_betas:
         # 计算beta
@@ -231,6 +232,7 @@ def calc_resid():
     beta_df.dropna(inplace=True)
     combined_df = df.merge(beta_df, on='ts_code', how='left')
     groups = combined_df.groupby('ts_code')
+
     resid_results = Parallel(n_jobs=-1)(
         delayed(calc_single_resid)(code, group_df) 
     for code, group_df in tqdm(groups, desc='计算残差', ncols=80, position=0, leave=True)
@@ -242,6 +244,52 @@ def calc_resid():
     # 合并结果
     all_resid = pd.concat(resid_results)
     db_utils.write_to_db(all_resid, 'stock_resids', save_mode='append')
+
+def calc_spec_vol():
+    """
+    基于 stock_resids 计算特质波动率因子（日频）
+    特质波动率 = 近20个交易日残差的波动率 = std(residuals)
+    结果存入 spec_vol 表，列为 (ts_code, trade_date, factor)
+    """
+    dates_todo = get_data.get_dates_todo('spec_vol')
+    if not dates_todo:
+        print("特质波动率因子数据已是最新")
+        return
+
+    # 往前多取 45 自然日作为缓冲，确保能填满 20 交易日滚动窗口
+    start_dt = pd.to_datetime(str(dates_todo[0]), format='%Y%m%d') - timedelta(days=45)
+    start_str = start_dt.strftime('%Y%m%d')
+
+    query = f"""
+    SELECT ts_code, trade_date, resid
+    FROM stock_resids
+    WHERE trade_date >= '{start_str}' AND trade_date <= '{dates_todo[-1]}'
+    ORDER BY ts_code, trade_date
+    """
+    df = db_utils.read_sql(query)
+
+    if df.empty:
+        print("stock_resids 为空，请先运行 calc_resid()")
+        return
+
+    df['trade_date'] = df['trade_date'].astype(str)
+    df = df.sort_values(['ts_code', 'trade_date'])
+
+    # 按股票分组，计算滚动 20 日波动率
+    df['factor'] = df.groupby('ts_code')['resid'].transform(
+        lambda x: x.rolling(window=20, min_periods=20).std()
+    )
+
+    result = df[df['trade_date'].isin(dates_todo)][['ts_code', 'trade_date', 'factor']]
+    result = result.dropna(subset=['factor'])
+
+    if result.empty:
+        print("没有可保存的特质波动率数据（残差历史可能不足 20 个交易日）")
+        return
+
+    db_utils.write_to_db(result, 'spec_vol', save_mode='append')
+    print(f"特质波动率因子计算完成，共 {len(result)} 条记录")
+
 
 def winsorize(series, n=3):
     """按 n 倍标准差截尾"""

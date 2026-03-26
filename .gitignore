@@ -1,0 +1,39 @@
+# 数据库文件
+*.db
+
+# 个人文件
+guide/
+# 保护版权
+Data/
+
+
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# LaTeX 源文件及编译产物（保留 PDF）
+*.tex
+*.aux
+*.log
+*.nav
+*.snm
+*.toc
+*.vrb
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+# 明确允许 PDF 上传
+!*.pdf

@@ -1,7 +1,0 @@
-pandas
-numpy
-joblib
-matplotlib
-duckdb
-tqdm
-tushare

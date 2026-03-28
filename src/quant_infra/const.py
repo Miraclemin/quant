@@ -14,6 +14,25 @@ FREQ_MAP = {
     '周度': 'W',
     '月度': 'M',
 }
+## 计算单日IC时，最小的样本量
+MIN_IC_SIZE = 10
 
-MIN_IC_SIZE = 500
+## 默认的用3个标准差来计算极端值的范围
 N_SIGMAS = 3
+
+# 达到api限制后，等待的时间（秒）
+LIMIT_SLEEP_SECONDS = 15
+
+# 数据库路径常量
+DB_PATH = './Data/data.db'
+
+# 基础信息存储路径常量
+BASIC_INFO_PATH = 'Data/Metadata'
+
+## 存储财务数据的更新时间（因为获取时间很久，而且财务数据频率较低，所以单独记录更新时间，避免每次运行都更新财务数据）
+FETCH_LOG_PATH = f'{BASIC_INFO_PATH}/fetch_log.csv'
+# 设置更新频率，单位为天。财务数据更新频率较低，所以设置为180天（半年）更新一次。
+FINANCIAL_RENEW_DAYS = 180
+
+# 回测开始时间
+START_DATE = '20160101'

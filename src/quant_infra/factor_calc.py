@@ -1,17 +1,17 @@
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
 import os
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from quant_infra import db_utils, get_data
 from datetime import datetime, timedelta
-from pandas.tseries.offsets import MonthBegin
 
 #按日期计算定价因子   
 # 定义单日计算函数
 def calc_single_pricing_factors(trade_date, day_df):
-    """计算单个交易日的定价因子"""
+    """计算单个交易日的定价因子
+    return:dict 包含 trade_date, MKT, SMB, HML, UMD
+    """
     # 过滤有效数据
     valid_data = day_df.dropna(subset=['pct_chg'])
     
@@ -33,7 +33,7 @@ def calc_single_pricing_factors(trade_date, day_df):
         sub_data = valid_data.dropna(subset=[col])
         if len(sub_data) >= 3:
             sub_data = sub_data.sort_values(col)
-            n_third = max(1, len(sub_data) // 3)
+            n_third = len(sub_data) // 3
             ret_low = sub_data.iloc[:n_third]['pct_chg'].mean()
             ret_high = sub_data.iloc[-n_third:]['pct_chg'].mean()
             # low_minus_high 为 True 时：用 低组（前33%） 减 高组（后33%）
@@ -42,7 +42,7 @@ def calc_single_pricing_factors(trade_date, day_df):
     return {
         'trade_date': int(trade_date),
         'MKT': mkt_factor,
-        **factors_dict
+        **factors_dict  ## 字典解包
     }
 def compute_pricing_factors():
     """
@@ -61,9 +61,9 @@ def compute_pricing_factors():
     
     print('开始计算新的定价因子')
     # 过滤出需要计算的日期，由于是几个定价因子都是依据上一个月末的数据算的，所以要有“上个月第一个天————最新日期的完整数据”
-    # 除了第一次计算要算beta外，后续计算时，只用算出几个定价因子值就可以了
-    first_month_date = pd.to_datetime(str(dates_to_download[0]), format='%Y%m%d') - MonthBegin(2)
-    first_month_date_str = first_month_date.strftime('%Y%m%d')
+    # 获得上一个月第一天的方式与get_ins中的一样
+    last_day_of_last_month = pd.to_datetime(str(dates_to_download[0]), format='%Y%m%d').replace(day=1) - timedelta(days=1)
+    first_month_date_str = last_day_of_last_month.replace(day=1).strftime('%Y%m%d')
     last_date = dates_to_download[-1]
 
     # 使用 SQL 直接合并股票数据和财务数据
@@ -79,15 +79,12 @@ def compute_pricing_factors():
     if len(df) == 0:
         print('daily_basic和 stock_bar 合并后没有数据，检查两表的最新数据是否下载成功')
         return
-    
 
     # 3. 添加年月标识（用于分组，基于trade_date）
-    # print('计算年月标识...')
     df['date'] = pd.to_datetime(df['trade_date'].astype(str), format='%Y%m%d', errors='coerce')
     df['year_month'] = df['date'].dt.to_period('M')
     
     df = df.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
-
     # 1. 先计算出每只股票每个月唯一的指标（月度表）
     monthly_df = df.groupby(['ts_code', 'year_month']).agg({
         'pct_chg': 'sum',
@@ -108,20 +105,21 @@ def compute_pricing_factors():
 
     # 3. 将这些“上月值”合并回原有的日线 df
     # 删掉月度表里原本的当月值列（由日数据聚合得到的），避免重名冲突
-    monthly_df = monthly_df.drop(columns=['pct_chg', 'total_mv', 'pb'])
+    monthly_df = monthly_df[['ts_code', 'year_month', 'month_ret', 'month_mv', 'month_pb']]
     df = pd.merge(df[['ts_code', 'trade_date', 'pct_chg', 'year_month']], monthly_df, on=['ts_code', 'year_month'], how='left')
     df.dropna(subset=['month_ret', 'month_mv', 'month_pb'], inplace=True)
+    ## 只保留需要更新的列，防止后续在月内写入重复的列
     df = df[df['trade_date'].isin(dates_to_download)]
     # 5.按交易日分组，并行计算每个交易日的定价因子
     daily_groups = list(df.groupby('trade_date'))
     
-    pricing_factors = Parallel(n_jobs=-1)(
+    results = Parallel(n_jobs=-1)(
         delayed(calc_single_pricing_factors)(trade_date, day_df) 
-        for trade_date, day_df in tqdm(daily_groups, desc='计算定价因子', ncols=80, position=0, leave=True)
+        for trade_date, day_df in tqdm(daily_groups, desc='计算定价因子')
     )
     
     # 过滤掉None结果
-    pricing_factors = [f for f in pricing_factors if f is not None]
+    pricing_factors = [dic for dic in results if dic is not None]
         
     # 输出结果
     result_df = pd.DataFrame(pricing_factors)
@@ -155,8 +153,9 @@ def calc_single_beta(ts_code, stock_df):
         return beta_info
         
     except Exception as e:
-        # 完全静默，不抛出异常
-        return
+        # 保持并行任务不中断，但输出最小必要信息便于排查
+        print(f"calc_single_beta 失败: ts_code={ts_code}, error={type(e).__name__}: {e}")
+        return None
 
 def calc_single_resid(code, stock_df):
     try:
@@ -164,19 +163,21 @@ def calc_single_resid(code, stock_df):
         y_full = stock_df['pct_chg'].to_numpy()
 
         # 单只股票在该分组内应只有一套 beta，取首行并转为 1D 向量
+        # to_numpy一行时就转为向量，如果是多行就保持二维
         beta_vec = stock_df[['intercept', 'MKT_beta', 'SMB_beta', 'HML_beta', 'UMD_beta']].iloc[0].to_numpy(dtype=float)
         y_hat = X_full @ beta_vec
         stock_df['resid'] = y_full - y_hat
         return stock_df[['ts_code', 'trade_date', 'resid']]
     except Exception as e:
+        # 返回空结果避免中断整体流程，同时保留错误上下文
+        print(f"calc_single_resid 失败: ts_code={code}, error={type(e).__name__}: {e}")
         return pd.DataFrame()
-
 
 def calc_resid():
     """
     需要能够判断是否需要获取beta，没有就计算
     计算resid后，直接写入数据库
-    还应支持不会每次都重新计算
+    支持append新数据
     """
     compute_pricing_factors()
     dates_to_download = get_data.get_dates_todo('stock_resids')
@@ -186,7 +187,6 @@ def calc_resid():
     # ========== 检查是否已有beta系数 ==========
     existing_betas = False
     try:
-        # 读取全部 beta 表（更健壮），如果存在 status 列则过滤掉被标记为 failed 的记录
         count = db_utils.read_sql("SELECT Count(*) FROM stock_betas").squeeze()
         if count > 5000:
             existing_betas = True
@@ -227,15 +227,15 @@ def calc_resid():
         db_utils.write_to_db(beta_df, 'stock_betas', save_mode='replace')
         
     
-    # 计算每日的残差
+    # 先合并beta数据至日频，之后计算每日的残差
     beta_df = db_utils.read_sql("SELECT ts_code, intercept, MKT_beta, SMB_beta, HML_beta, UMD_beta FROM stock_betas")
     beta_df.dropna(inplace=True)
-    combined_df = df.merge(beta_df, on='ts_code', how='left')
-    groups = combined_df.groupby('ts_code')
+    all_df = df.merge(beta_df, on='ts_code', how='left')
+    groups = all_df.groupby('ts_code')
 
     resid_results = Parallel(n_jobs=-1)(
         delayed(calc_single_resid)(code, group_df) 
-    for code, group_df in tqdm(groups, desc='计算残差', ncols=80, position=0, leave=True)
+    for code, group_df in tqdm(groups, desc='计算残差')
     )
     resid_results = [x for x in resid_results if x is not None and not x.empty]
     if not resid_results:
@@ -251,19 +251,19 @@ def calc_spec_vol():
     特质波动率 = 近20个交易日残差的波动率 = std(residuals)
     结果存入 spec_vol 表，列为 (ts_code, trade_date, factor)
     """
-    dates_todo = get_data.get_dates_todo('spec_vol')
-    if not dates_todo:
+    dates_to_download = get_data.get_dates_todo('spec_vol')
+    if not dates_to_download:
         print("特质波动率因子数据已是最新")
         return
 
     # 往前多取 45 自然日作为缓冲，确保能填满 20 交易日滚动窗口
-    start_dt = pd.to_datetime(str(dates_todo[0]), format='%Y%m%d') - timedelta(days=45)
+    start_dt = pd.to_datetime(str(dates_to_download[0]), format='%Y%m%d') - timedelta(days=45)
     start_str = start_dt.strftime('%Y%m%d')
 
     query = f"""
     SELECT ts_code, trade_date, resid
     FROM stock_resids
-    WHERE trade_date >= '{start_str}' AND trade_date <= '{dates_todo[-1]}'
+    WHERE trade_date >= '{start_str}' AND trade_date <= '{dates_to_download[-1]}'
     ORDER BY ts_code, trade_date
     """
     df = db_utils.read_sql(query)
@@ -280,7 +280,7 @@ def calc_spec_vol():
         lambda x: x.rolling(window=20, min_periods=20).std()
     )
 
-    result = df[df['trade_date'].isin(dates_todo)][['ts_code', 'trade_date', 'factor']]
+    result = df[df['trade_date'].isin(dates_to_download)][['ts_code', 'trade_date', 'factor']]
     result = result.dropna(subset=['factor'])
 
     if result.empty:
@@ -289,9 +289,8 @@ def calc_spec_vol():
 
     db_utils.write_to_db(result, 'spec_vol', save_mode='append')
     print(f"特质波动率因子计算完成，共 {len(result)} 条记录")
-
-
 def winsorize(series, n=3):
-    """按 n 倍标准差截尾"""
+    """按 n 倍标准差缩尾，将超过范围的值替换为边界值"""
     mean, std = series.mean(), series.std()
     return series.clip(mean - n * std, mean + n * std)
+

@@ -6,10 +6,7 @@ import duckdb
 import pandas as pd
 import os
 from pathlib import Path
-
-# 数据库路径常量
-DB_PATH = './Data/data.db'
-
+from quant_infra.const import *
 def init_db():
     """初始化数据库连接
     如果数据库文件不存在，会自动创建
@@ -19,13 +16,12 @@ def init_db():
     try:
         return duckdb.connect(DB_PATH)
     except duckdb.IOException as e:
-        msg = str(e)
-        if any(kw in msg for kw in ('Could not set lock', 'already open', '另一个程序', 'resource temporarily unavailable')):
+        wrong_message = str(e)
+        if any(keyword in wrong_message for keyword in ('Could not set lock', 'already open', '另一个程序', 'resource temporarily unavailable')):
             raise RuntimeError(
-                f"数据库文件 '{DB_PATH}' 正被其他程序占用，请先关闭后重试。\n({msg.splitlines()[0]})"
+                f"数据库文件 '{DB_PATH}' 正被其他程序占用，请先关闭后重试。\n({wrong_message.splitlines()[0]})"
             ) from None
         raise
-
 def read_sql(query):
     """
     执行SQL查询并返回DataFrame
@@ -57,6 +53,7 @@ def write_to_db(df, table_name, save_mode ='replace'):
         conn.register('temp_df', df)
         # 检查表格是否存在
         table_exists_query = f"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '{table_name}'"
+        ## 取第一行.fetchone()的第一列[0]，如果大于0说明表格存在
         table_exists = conn.execute(table_exists_query).fetchone()[0] > 0
 
         if table_exists:
@@ -72,16 +69,3 @@ def write_to_db(df, table_name, save_mode ='replace'):
     finally:
         conn.close()
 
-
-
-
-if __name__ == '__main__':
-    conn = init_db()
-    conn.sql("SHOW TABLES").show()
-    conn.sql("DESCRIBE stock_bar").show()
-    # 方式 A：直接打印到控制台（非常漂亮的可视化表格）
-    # conn.table('pricing_factors').show()
-
-    # 方式 B：获取列名列表
-    columns = conn.execute("PRAGMA table_info('week_factor')").fetchall()
-    print([col[1] for col in columns]) # 只打印列名

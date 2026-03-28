@@ -122,6 +122,7 @@ src/quant_infra/
 
 汇总指标保存至 `factor_mining/{factor_table}/output/summary.csv`，日度多空收益序列写入 DuckDB 的 `{factor_table}_daily_ls` 表。
 
+
 #### `group_plot(sample, freq, line, factor_table)`
 
 从 DuckDB 读取指定样本 & 频率的日度收益序列，绘制**累计净值曲线**并保存为 PNG，支持多空收益（`ls_ret`）、纯多头（`long`）、纯空头（`short`）三条线可选。

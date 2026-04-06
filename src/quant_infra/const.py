@@ -38,3 +38,6 @@ BASIC_RENEW_DAYS = 365
 
 # 回测开始时间
 START_DATE = '20160101'
+
+# 行业信息更新频率，一年更新一次
+INDUSTRY_RENEW_DAYS = 365

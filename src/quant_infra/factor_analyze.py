@@ -69,17 +69,17 @@ def specific_group(fac, stk, group_set, bench_df, n_groups=10, pathway_delay=0, 
     # 轨道延迟：将日期前移 pathway_delay 个交易日后再划分周期，等效于将调仓边界后移
     if pathway_delay > 0 and trade_days is not None:
         # 通过改写日期实现推迟调仓。例如：
-        # trade_days = [2026-03-26, 2026-03-27, 2026-03-28], delay = 1
-        n_td = len(trade_days)
-        # np.arange(n_td)生成一个0到n_td-1的数组，形如 [0, 1, 2]
-        # 减去偏移后，并且缩尾后，成为 idx_arr = [0, 0, 1]
-        idx_arr = np.clip(np.arange(n_td) - pathway_delay, 0, n_td - 1) 
+        # trade_days = [2026-03-01, 2026-03-02, 2026-03-03], delay = 1
+        trade_day_index = pd.DatetimeIndex(trade_days)
+        shifted_trade_days = pd.Series(trade_day_index, index=trade_day_index).shift(pathway_delay)
+        _shift_map = shifted_trade_days.fillna(trade_day_index[0])
 
-        # _shift_map = {2026-03-26:2026-03-26, 2026-03-27:2026-03-26, 2026-03-28:2026-03-27} 一个series，index是原日期，value是被映射后的日期
-        _shift_map = pd.Series(trade_days[idx_arr], index=pd.DatetimeIndex(trade_days))
-        # 结果：原本2026-03-27的数据伪装成了2026-03-26，原本2026-03-28的伪装成了2026-03-27。
+        # _shift_map = {2026-03-01:2026-02-28, 2026-03-02:2026-03-01, 2026-03-03:2026-03-02}
+        # index 是原日期，value 是向下平移 pathway_delay 个交易日后的映射日期；超出起点的部分用首个交易日补齐
+        # 结果：原本2026-03-02的数据伪装成了2026-03-01，原本2026-03-03的伪装成了2026-03-02。
 
-        # 后续按月或周划分Period时，原本在2026-03-26触发的边界会因为日期"名义上前移"而推迟到2026-03-27才触发。
+        # 后续按月或周划分 Period 时，若月度划分以 2026-03-01 为边界，
+        # 则边界会因为日期"名义上前移"而推迟到下一个交易日才触发。
 
         ## _pdate是一个序列
         fac_pdate = fac['date'].map(_shift_map)  ## 直接修改日期列，这样fac与stk的日期都被统一偏移了，后续的周期划分自然就后移了。

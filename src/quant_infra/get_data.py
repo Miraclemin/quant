@@ -208,8 +208,7 @@ def get_basic():
     if last_fetch:
         last_fetch_dt = datetime.strptime(last_fetch, '%Y%m%d')
         if datetime.now() - last_fetch_dt < timedelta(days=BASIC_RENEW_DAYS):
-            print(f"stock_basic 无需更新，上次更新于 {last_fetch}")
-            return
+            return db_utils.read_sql('SELECT * FROM stock_basic')
     pro = _get_pro_client()
     df = pro.stock_basic()
     db_utils.write_to_db(df, 'stock_basic', save_mode='replace')
@@ -277,10 +276,39 @@ def get_financial():
         new_data = pd.concat(all_df, ignore_index=True)
         db_utils.write_to_db(new_data, 'fina_indicator', save_mode='replace')
         set_last_fetch_date('fina_indicator')
+def get_industry():
+    last_fetch = get_last_fetch_date('sw_industry')
+    if last_fetch:
+        last_fetch_dt = datetime.strptime(last_fetch, '%Y%m%d')
+        if datetime.now() - last_fetch_dt < timedelta(days=INDUSTRY_RENEW_DAYS):
+            return db_utils.read_sql('SELECT * FROM sw_industry')
+    # 本地没有或已经超过指定天数，则从 tushare 获取
+    all_data = []
+    limit = 3000  # 设置单次获取上限
+    offset = 0    # 初始偏移量为0
+    pro = _get_pro_client()
+    while True:
+        # 传入分页参数
+        df = pro.index_member_all(limit=limit, offset=offset)
+        # 如果返回的 DataFrame 为空，说明已经取到了最后
+        if df.empty:
+            print("已获取所有数据。")
+            break
+            
+        all_data.append(df)
+        print(f"已获取偏移量 {offset} 开始的 {len(df)} 条数据")
+        # 增加偏移量，准备取下一页
+        offset += limit
+        
+    # 合并所有数据
+    df = pd.concat(all_data, ignore_index=True)
+    db_utils.write_to_db(df, 'sw_industry', save_mode='replace')
+    set_last_fetch_date('sw_industry')
+    return df
 
 # if __name__ == "__main__":
     # pro = _get_pro_client()
-    # df = pro.fina_indicator(ts_code='000001.SZ')
-    # print(df)
-    # get_financial()
+    # df = pro.index_member_all()
+    # df.to_csv("test.csv")
+
 

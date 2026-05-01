@@ -14,6 +14,12 @@ __pycache__/
 *$py.class
 src/quant_infra.egg-info/
 
+# 本地 agent 配置与运行状态
+agent/config.yaml
+agent/journal/
+.omc/
+docs/superpowers/
+
 # 虚拟环境
 venv/
 env/

@@ -1,0 +1,34 @@
+strategy: spec_vol
+phase: papertrade
+
+account_size_cny: 500000
+n_top: 5
+
+rebalance_freq: 月度
+sample: 全市场
+output_dir: output2
+
+notify:
+  channels:
+    - telegram
+  email:
+    enabled: false
+    smtp_host: smtp.qq.com
+    smtp_port: 465
+    use_ssl: true
+    from_addr: "${EMAIL_FROM}"
+    from_password: "${EMAIL_PASSWORD}"
+    to_addrs:
+      - "${EMAIL_TO}"
+  telegram:
+    enabled: true
+    bot_token: "${TG_BOT_TOKEN}"
+    chat_id: "${TG_CHAT_ID}"
+
+schedule:
+  papertrade_time: "16:30"
+  livetrade_time: "09:00"
+
+data_update:
+  auto_run_main: true
+  skip_if_not_trading_day: true

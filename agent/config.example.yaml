@@ -4,31 +4,41 @@ phase: papertrade
 account_size_cny: 500000
 n_top: 5
 
-rebalance_freq: 月度
+rebalance_freq: 日度        # 日度 / 周度 / 月度
 sample: 全市场
 output_dir: output2
+start_date: "20260101"     # 模拟起始日期，格式 YYYYMMDD，删除此行则从最早数据开始
 
 notify:
   channels:
-    - telegram
-  email:
+    - resend              # 启用的通知渠道，可同时填多个：resend / telegram / email
+    # - telegram
+
+  resend:
+    enabled: true
+    api_key: "${RESEND_API_KEY}"
+    from_addr: "${RESEND_FROM}"   # 必须是 Resend 已验证的域名地址
+    to_addrs:
+      - "${EMAIL_TO}"
+
+  telegram:
+    enabled: false
+    bot_token: "${TG_BOT_TOKEN}"
+    chat_id: "${TG_CHAT_ID}"
+
+  email:                  # 旧 SMTP 方案，不用时保持 enabled: false
     enabled: false
     smtp_host: smtp.qq.com
     smtp_port: 465
     use_ssl: true
-    from_addr: "${EMAIL_FROM}"
-    from_password: "${EMAIL_PASSWORD}"
-    to_addrs:
-      - "${EMAIL_TO}"
-  telegram:
-    enabled: true
-    bot_token: "${TG_BOT_TOKEN}"
-    chat_id: "${TG_CHAT_ID}"
+    from_addr: ""
+    from_password: ""
+    to_addrs: []
 
 schedule:
   papertrade_time: "16:30"
   livetrade_time: "09:00"
 
 data_update:
-  auto_run_main: true
-  skip_if_not_trading_day: true
+  auto_run_main: true             # true = 每次自动运行 factor_mining/{strategy}/main.py
+  skip_if_not_trading_day: true   # true = 非交易日跳过

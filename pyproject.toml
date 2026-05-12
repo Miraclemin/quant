@@ -21,6 +21,7 @@ dependencies = [
     "python-dotenv>=1.1.1",
     "PyYAML>=6.0.2",
     "requests>=2.32.3",
+    "schedule>=1.2.0",
 ]
 
 [tool.setuptools.packages.find]

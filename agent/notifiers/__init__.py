@@ -5,6 +5,7 @@ import os
 from agent.config import AgentConfig
 from agent.notifiers.base import FormattedMessage
 from agent.notifiers.email import EmailNotifier
+from agent.notifiers.resend import ResendNotifier
 from agent.notifiers.telegram import TelegramNotifier
 
 
@@ -22,4 +23,8 @@ def get_notifier(channel: str, cfg: AgentConfig):
         return TelegramNotifier(cfg.notify.telegram)
     if channel == "email":
         return EmailNotifier(cfg.notify.email)
+    if channel == "resend":
+        if cfg.notify.resend is None:
+            raise ValueError("resend channel enabled but [notify.resend] not configured")
+        return ResendNotifier(cfg.notify.resend)
     raise ValueError(f"Unsupported notifier channel: {channel}")

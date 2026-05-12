@@ -113,9 +113,11 @@ def build(cfg: AgentConfig) -> dict[str, Any]:
     holdings_df = _read_holdings_csv(holdings_path)
     if holdings_df.empty:
         raise RuntimeError(f"No holdings found in {holdings_path}")
-    latest_row = holdings_df.iloc[0]
-    codes = [item.strip() for item in str(latest_row["持仓股票"]).split(",") if item.strip()]
-    names = [item.strip() for item in str(latest_row["持仓股票名称"]).split(",") if item.strip()]
+    new_row = holdings_df.iloc[0]
+    # iloc[1] 是今天实际持有的（昨天选出），与今日收益对应；iloc[0] 是明天才持有的新仓
+    today_row = holdings_df.iloc[1] if len(holdings_df) > 1 else new_row
+    codes = [item.strip() for item in str(today_row["持仓股票"]).split(",") if item.strip()]
+    names = [item.strip() for item in str(today_row["持仓股票名称"]).split(",") if item.strip()]
     market_data = _load_latest_market_data(cfg, codes)
     holdings = [
         HoldingRow(
@@ -138,11 +140,11 @@ def build(cfg: AgentConfig) -> dict[str, Any]:
             raise
     return {
         "strategy": cfg.strategy,
-        "sample": str(latest_row["样本"]),
+        "sample": str(today_row["样本"]),
         "rebalance_freq": cfg.rebalance_freq,
         "today": today,
         "holdings": holdings,
-        "holdings_count": int(latest_row["持仓数量"]),
+        "holdings_count": int(today_row["持仓数量"]),
         "latest_long": stats["latest_long"],
         "latest_bench_ret": stats["latest_bench_ret"],
         "excess_ret": stats["latest_long"] - stats["latest_bench_ret"],

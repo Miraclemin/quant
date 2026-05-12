@@ -25,11 +25,12 @@ def simulate_trade(
     other_name=None,
     sample="全市场",
     n_top=5,
-    is_ascending=False , # 默认以降序排列，即取因子值最高的前几个
+    is_ascending=False,
     commission_rate=2.5,
     slippage_rate=0.1,
     price_max=100.0,
     filter_boards=("创业板", "科创板", "北交所"),
+    start_date=None,
 ):
     """
     真实交易模拟回测，评价因子的头部选股能力
@@ -46,8 +47,8 @@ def simulate_trade(
         slippage_rate(float): 单边滑点率，按百分比输入（默认 0.1，即 0.1%）
         price_max(float): 股价过滤上限（默认 100 元）
         filter_boards(tuple/list/set): 交易权限过滤，指定要排除的板块。
-            可选值：'创业板'（创业板，300开头）、'科创板'（科创板，68开头）、'北交所'（北交所，4/8开头）。
-            默认 ('创业板', '科创板', '北交所') 过滤全部三个板块，传入空元组则不过滤。
+        start_date(str|None): 模拟起始日期，格式 'YYYYMMDD'，None 表示从最早数据开始。
+            注意：选股逻辑需要往前多取一个周期，因此实际因子读取会包含 start_date 前一个周期。
     """
     commission_rate = commission_rate / 10000.0
     slippage_rate = slippage_rate / 100.0
@@ -98,6 +99,16 @@ def simulate_trade(
     fac[period_col] = fac["date"].dt.to_period(p_freq)
     stk[period_col] = stk["date"].dt.to_period(p_freq)
 
+    # ----- start_date 过滤 -----
+    if start_date is not None:
+        start_dt = pd.to_datetime(str(start_date), format="%Y%m%d")
+        start_period = start_dt.to_period(p_freq)
+        # 因子数据多保留一个周期，确保首期持仓能被计算出来
+        fac = fac[fac[period_col] >= start_period - 1]
+        # 行情和基准只需从 start_date 开始
+        stk = stk[stk["date"] >= start_dt]
+        bench_df = bench_df[bench_df["trade_date"].astype(str) >= start_date]
+
     # ----- 5. 基准收益 -----
     bench_raw = get_index_data(bench_index)
     bench_raw["bench_ret"] = bench_raw["pct_chg"] / 100.0
@@ -142,7 +153,9 @@ def simulate_trade(
                 "持仓数量": len(selected),
             }
         )
-    holdings_df = pd.DataFrame(all_holdings).sort_values("换仓日", ascending = False, ignore_index=True)
+    holdings_df = pd.DataFrame(all_holdings).sort_values("换仓日", ascending=False, ignore_index=True)
+    if start_date is not None:
+        holdings_df = holdings_df[holdings_df["换仓日"] >= int(start_date)].reset_index(drop=True)
     output_path = Path("factor_mining") / factor_table / "output"
     output_path.mkdir(parents=True, exist_ok=True)
     holdings_df.to_csv(output_path / "trade_holdings.csv", index=False, encoding="utf-8-sig")
@@ -166,7 +179,6 @@ def simulate_trade(
     print(f"[{sample} - {trade_freq}] 多头年化夏普（含交易成本）: {round(SR, 2)}")
 
     db_utils.write_to_db(daily_ret, f"{factor_table}_trade_daily_ret", save_mode="replace")
-    group_plot(sample=sample, freq=trade_freq, line="long", factor_table=factor_table, mode="trade")
 def compute_portfolio_daily_ret(stk_df, holdings, period_col, commission_rate, slippage_rate):
     """
     按换仓周期合并日度等权收益，在每期首日扣除双边交易成本。

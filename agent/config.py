@@ -24,6 +24,14 @@ class EmailConfig:
 
 
 @dataclass(slots=True)
+class ResendConfig:
+    enabled: bool
+    api_key: str
+    from_addr: str
+    to_addrs: list[str]
+
+
+@dataclass(slots=True)
 class TelegramConfig:
     enabled: bool
     bot_token: str
@@ -35,9 +43,10 @@ class NotifyConfig:
     channels: list[str]
     email: EmailConfig
     telegram: TelegramConfig
+    resend: ResendConfig | None = None
 
     def __post_init__(self) -> None:
-        allowed = {"email", "telegram"}
+        allowed = {"email", "telegram", "resend"}
         unknown = set(self.channels) - allowed
         if unknown:
             raise ValueError(f"Unsupported notify channels: {sorted(unknown)}")
@@ -136,6 +145,7 @@ def _expand_value(value: Any, env: dict[str, str]) -> Any:
 def _build_config(data: dict[str, Any], agent_dir: Path) -> AgentConfig:
     notify_raw = data["notify"]
     project_root = agent_dir.parent
+    resend_raw = notify_raw.get("resend")
     return AgentConfig(
         strategy=str(data["strategy"]),
         phase=str(data["phase"]),
@@ -148,6 +158,7 @@ def _build_config(data: dict[str, Any], agent_dir: Path) -> AgentConfig:
             channels=[str(item) for item in notify_raw["channels"]],
             email=EmailConfig(**notify_raw["email"]),
             telegram=TelegramConfig(**notify_raw["telegram"]),
+            resend=ResendConfig(**resend_raw) if resend_raw else None,
         ),
         schedule=ScheduleConfig(**data["schedule"]),
         data_update=DataUpdateConfig(**data["data_update"]),
@@ -163,7 +174,8 @@ def load_config(config_path: str | Path | None = None, phase_override: str | Non
     if not resolved.exists():
         raise FileNotFoundError(f"Config not found: {resolved}")
     agent_dir = resolved.parent
-    env = _parse_env_file(agent_dir / ".env")
+    project_root = agent_dir.parent
+    env = {**_parse_env_file(project_root / ".env"), **_parse_env_file(agent_dir / ".env")}
     raw = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
     raw = _expand_value(raw, env)
     if phase_override:

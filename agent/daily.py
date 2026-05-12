@@ -34,7 +34,7 @@ def run_phase(cfg: AgentConfig) -> None:
     if cfg.data_update.skip_if_not_trading_day and not is_trading_day(today, trade_day_csv):
         _write_journal(cfg, f"- {today}: non-trading day, skipped")
         return
-    if cfg.data_update.auto_run_main:
+    if cfg.data_update.auto_run_main and cfg.phase == "papertrade":
         result = run_strategy_main(cfg.project_root, cfg.strategy)
         _write_journal(cfg, f"- strategy main ok: {result.args}")
     if cfg.phase == "papertrade":
